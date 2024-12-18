@@ -1,201 +1,311 @@
-from datetime import timedelta, datetime, date, time
-from zoneinfo import ZoneInfo
-
-from pandas import Timestamp
-from pytz import timezone
-from typing import Dict, List, Optional, Callable
-from copy import deepcopy
+import dataclasses
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Optional,Callable
 
 import pandas as pd
-from pandas.tseries.frequencies import to_offset
-import akshare as ak
+from pytz import timezone
+
+from numpy import ndarray
+from pandas import DataFrame
 
 from vnpy.trader.setting import SETTINGS
-from vnpy.trader.datafeed import BaseDatafeed
 from vnpy.trader.constant import Exchange, Interval
-from vnpy.trader.object import BarData, HistoryRequest
+from vnpy.trader.object import BarData, TickData, HistoryRequest
 from vnpy.trader.utility import round_to
+from vnpy.trader.datafeed import BaseDatafeed
 
-# 数据频率映射
-INTERVAL_VT2TS = {
-    Interval.MINUTE: "1min",
+import akshare as ak
+
+INTERVAL_VT2RQ: Dict[Interval, str] = {
+    Interval.DAILY: "daily",
+    Interval.WEEKLY: "weekly",
     Interval.HOUR: "60min",
-    Interval.DAILY: "D",
-    Interval.WEEKLY: "W"
+    Interval.MINUTE: "1min",
 }
 
-# 股票支持列表
-STOCK_LIST = [
-    Exchange.SEHK
-]
-
-# 期货支持列表
-FUTURE_LIST = [
-]
-
-# 交易所映射
-EXCHANGE_VT2TS = {
-    Exchange.SEHK: "HK",
-    Exchange.SSE: "SH",
-    Exchange.SZSE: "SZ",
-}
-
-# 时间调整映射
-INTERVAL_ADJUSTMENT_MAP = {
+INTERVAL_ADJUSTMENT_MAP: Dict[Interval, timedelta] = {
     Interval.MINUTE: timedelta(minutes=1),
     Interval.HOUR: timedelta(hours=1),
-    Interval.DAILY: timedelta(),
-    Interval.WEEKLY: timedelta()
+    Interval.DAILY: timedelta()         # no need to adjust for daily bar
 }
 
-# 中国上海时区
-CHINA_TZ = ZoneInfo("Asia/Shanghai")
+CHINA_TZ = timezone("Asia/Shanghai")
 
 
-func_price_map = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': lambda x: x.sum(min_count=1)}
+def string_to_date(ds: str) -> datetime:
+    return datetime.strptime(ds, "%Y-%m-%d")
 
+def string_to_datetime(ds: str) -> datetime:
+    return datetime.strptime(ds, "%Y-%m-%d %H:%M:%S")
 
-def to_ts_symbol(symbol, exchange) -> Optional[str]:
-    """将交易所代码转换为akshare代码"""
-    # 股票
-    if exchange in STOCK_LIST:
-        # ts_symbol = f"{symbol}.{EXCHANGE_VT2TS[exchange]}"
-        ts_symbol = f"0{symbol}"
-    # 期货
-    elif exchange in FUTURE_LIST:
-        ts_symbol = f"{symbol}.{EXCHANGE_VT2TS[exchange]}".upper()
-    else:
+def date_to_string(dd: datetime) -> str:
+    if dd is None:
         return None
-
-    return ts_symbol
-
-
-def to_ts_asset(symbol, exchange) -> Optional[str]:
-    """生成akshare资产类别"""
-    # 股票
-    if exchange in STOCK_LIST:
-        asset = "E"
-    # 期货
-    elif exchange in FUTURE_LIST:
-        asset = "FT"
-    else:
-        return None
-
-    return asset
+    return dd.strftime("%Y%m%d")
 
 
-class AkshareDatafeed(BaseDatafeed):
-    """akshare数据服务接口"""
+@dataclasses.dataclass
+class TradeDate:
+    start:datetime
+    end: datetime
+    date_list: List[datetime]
 
-    def __init__(self, username=None, password=None):
-        """"""
-        self.username: str = SETTINGS["datafeed.username"] if username is None else username
-        self.password: str = SETTINGS["datafeed.password"] if password is None else password
 
-        self.inited: bool = False
+class Country(Enum):
+    China = "china"
+    US = "us"
+    UK = "uk"
 
-    def init(self, output: Callable = print) -> bool:
-        """初始化"""
-        if self.inited:
-            return True
 
-        # ak.set_token(self.password)
-        # self.pro = ak.pro_api()
+country_trade_date: Dict[Country, TradeDate or None] = {
+    Country.China: None,
+    Country.US: None,
+    Country.UK: None,
+}
+
+
+EXCHANGE_COUNTRY = {
+    Country.China: {
+        Exchange.CFFEX,
+        Exchange.SHFE,
+        Exchange.CZCE,
+        Exchange.DCE,
+        Exchange.INE,
+        Exchange.SSE,
+        Exchange.SZSE,
+        Exchange.BSE,
+        Exchange.SGE,
+        Exchange.WXE,
+        Exchange.CFETS,
+        Exchange.XBOND,
+    },
+}
+
+
+def get_country(exchange: Exchange):
+    for country, exchange_set in EXCHANGE_COUNTRY.items():
+        if exchange in exchange_set:
+            return country
+
+    return None
+
+
+def get_zh_a_trader_date():
+    date_list = list(ak.stock_zh_index_daily_tx("sh000919").date)
+    date_list = [string_to_date(d) for d in date_list]
+    start = date_list[0]
+    end = date_list[-1]
+    return TradeDate(start, end, date_list)
+
+
+def get_trade_date(exchange, start: datetime, end: datetime)-> List[datetime]:
+    country = get_country(exchange)
+    td = country_trade_date[country]
+    if td is None:
+        if country == Country.China:
+            td = get_zh_a_trader_date()
+        country_trade_date[country] = td
+
+    return [d for d in td.date_list if end >= d >= start]
+
+
+class BaseFeed:
+    def query_bar_history(self, req: HistoryRequest) -> pd.DataFrame:
+
+        pass
+
+    def query_tick_history(self, req: HistoryRequest) -> pd.DataFrame:
+        pass
+
+
+class ZhADataFeed(BaseFeed):
+    def query_bar_history(self, req: HistoryRequest) -> pd.DataFrame:
+        symbol: str = req.symbol
+        interval: Interval = req.interval
+        start: datetime = req.start
+        end: datetime = req.end
+
+        if interval is None:
+            interval = Interval.DAILY
+
+        if interval==Interval.MINUTE:
+            # 1分钟数据
+            df = ak.stock_zh_a_hist_min_em(symbol, date_to_string(start), date_to_string(end), period='1', adjust="qfq")
+
+            df.rename(columns={
+                '时间': "datetime",
+                '开盘': 'open',
+                '收盘': 'close',
+                '最高': 'high',
+                '最低': 'low',
+                '成交量': 'volume',
+                '成交额': 'turnover',
+            }, inplace=True)
+        elif interval==Interval.DAILY:
+            # 日频数据
+            period = INTERVAL_VT2RQ[interval]
+            df = ak.stock_zh_a_hist(symbol, period, date_to_string(start), date_to_string(end), "hfq")
+
+            df.rename(columns={
+                '日期': "datetime",
+                '开盘': 'open',
+                '收盘': 'close',
+                '最高': 'high',
+                '最低': 'low',
+                '成交量': 'volume',
+                '成交额': 'turnover',
+            }, inplace=True)
+        elif interval==Interval.HOUR:
+            # 1小时数据
+            df = ak.stock_zh_a_hist_min_em(symbol, date_to_string(start), date_to_string(end), period='60', adjust="qfq")
+
+            df.rename(columns={
+                '时间': "datetime",
+                '开盘': 'open',
+                '收盘': 'close',
+                '最高': 'high',
+                '最低': 'low',
+                '成交量': 'volume',
+                '成交额': 'turnover',
+            }, inplace=True)
+
+        return df
+
+    def query_tick_history(self, req: HistoryRequest) -> pd.DataFrame:
+        symbol: str = req.symbol
+        start: datetime = req.start
+        end: datetime = req.end
+
+        if end is None:
+            end = datetime.now()
+
+        date_list = get_trade_date(req.exchange, start, end)
+        ret = []
+        for d in date_list:
+            ret.append(ak.stock_zh_a_tick_163(symbol, date_to_string(d)))
+
+        return pd.concat(ret)
+
+
+class ZhFutureDataFeed(BaseFeed):
+    def query_bar_history(self, req: HistoryRequest) -> pd.DataFrame:
+        symbol: str = req.symbol
+
+        start: datetime = req.start
+        end: datetime = req.end
+        exchange = req.exchange
+
+        df = ak.get_futures_daily(date_to_string(start), date_to_string(end), exchange.value)
+
+        return df
+
+    def query_tick_history(self, req: HistoryRequest) -> pd.DataFrame:
+        symbol: str = req.symbol
+        start: datetime = req.start
+        end: datetime = req.end
+
+        if end is None:
+            end = datetime.now()
+
+        date_list = get_trade_date(req.exchange, start, end)
+        ret = []
+        for d in date_list:
+            ret.append(ak.stock_zh_a_tick_163(symbol, date_to_string(d)))
+
+        return pd.concat(ret)
+
+
+FEEDS = {
+    Exchange.CFFEX: ZhFutureDataFeed,
+    Exchange.SHFE: ZhFutureDataFeed,
+    Exchange.CZCE: ZhFutureDataFeed,
+    Exchange.DCE: ZhFutureDataFeed,
+    Exchange.INE: ZhFutureDataFeed,
+
+    Exchange.SSE: ZhADataFeed,
+    Exchange.SZSE: ZhADataFeed,
+    Exchange.BSE: ZhADataFeed,
+}
+
+
+class AKShareDataFeed(BaseDatafeed):
+    """AKData数据服务接口"""
+
+    def __init__(self):
+        self.inited = False
+
+    def init(self,output: Callable = print) -> bool:
         self.inited = True
-
         return True
 
-    def query_bar_history(self, req: HistoryRequest, output: Callable = print) -> Optional[List[BarData]]:
-        """查询k线数据"""
+    def convert_df_to_bar(self, req: HistoryRequest, df: DataFrame) -> Optional[List[BarData]]:
+
+        data: List[BarData] = []
+
+        interval: Interval = req.interval if req.interval is not None else Interval.DAILY
+
+        # 为了将时间戳（K线结束时点）转换为VeighNa时间戳（K线开始时点）
+        adjustment: timedelta = INTERVAL_ADJUSTMENT_MAP[interval]
+
+        if df is not None:
+            # 填充NaN为0
+            df.fillna(0, inplace=True)
+
+            for row in df.itertuples():
+                if interval==Interval.MINUTE:
+                    dt: datetime = string_to_datetime(row.datetime)
+                elif interval==Interval.DAILY:
+                    dt: datetime = string_to_date(row.datetime)
+                elif interval==Interval.HOUR:
+                    dt: datetime = string_to_datetime(row.datetime)
+                dt: datetime = dt - adjustment
+                dt: datetime = CHINA_TZ.localize(dt)
+
+                bar: BarData = BarData(
+                    symbol=req.symbol,
+                    exchange=req.exchange,
+                    interval=interval,
+                    datetime=dt,
+                    open_price=round_to(row.open, 0.000001),
+                    high_price=round_to(row.high, 0.000001),
+                    low_price=round_to(row.low, 0.000001),
+                    close_price=round_to(row.close, 0.000001),
+                    volume=row.volume,
+                    turnover=row.turnover,
+                    open_interest=getattr(row, "open_interest", 0),
+                    gateway_name="AK"
+                )
+
+                data.append(bar)
+
+        return data
+
+    def convert_df_to_tick(self, df: DataFrame) -> Optional[List[TickData]]:
+        return df
+
+    def query_bar_history(self, req: HistoryRequest,output: Callable = print) -> Optional[List[BarData]]:
+        """查询K线数据"""
         if not self.inited:
-            self.init(output)
+            n: bool = self.init()
+            if not n:
+                return []
 
-        symbol = req.symbol
-        exchange = req.exchange
-        interval = req.interval
-        start = req.start
-        end = req.end
-
-        ak_symbol = to_ts_symbol(symbol, exchange)
-        if not ak_symbol:
-            return None
-
-        ts_interval = INTERVAL_VT2TS.get(interval)
-        if not ts_interval:
-            return None
-
-        try:
-            d1 = ak.stock_hk_daily(
-                symbol=ak_symbol,
-                adjust='qfq'
-            )
-        except IOError:
+        exchange: Exchange = req.exchange
+        if exchange not in FEEDS:
             return []
 
-        df = deepcopy(d1)
+        clazz = FEEDS[exchange]
+        df = clazz().query_bar_history(req)
 
-        # 处理原始数据中的NaN值
-        df.fillna(0, inplace=True)
+        return self.convert_df_to_bar(req, df)
 
-        data: List[BarData] = []
-        if df is not None:
-            if interval.value in ["d"]:
-                data = self.handle_bar_data(df, symbol, exchange, interval, start, end)
-            elif interval.value in ['w']:
-                df.index = pd.DatetimeIndex(pd.to_datetime(df['date']))
-                w_df = df.resample('W').agg(func_price_map).dropna()
-                w_df.index = w_df.index + to_offset("-2D")
-                dt = w_df.index.to_pydatetime()
-                w_df["date"] = [x.date() for x in dt]
-                data = self.handle_bar_data(w_df, symbol, exchange, interval, start, end)
-        return data
+    def query_tick_history(self, req: HistoryRequest) -> Optional[List[TickData]]:
+        exchange: Exchange = req.exchange
+        if exchange not in FEEDS:
+            return []
 
-    def handle_bar_data(self, df, symbol, exchange, interval, start, end):
-        bar_dict: Dict[datetime, BarData] = {}
-        data: List[BarData] = []
+        clazz = FEEDS[exchange]
 
-        adjustment = INTERVAL_ADJUSTMENT_MAP[interval]
-
-        for row in df.itertuples():
-            dt: datetime = None
-            if type(row.date) == Timestamp:
-                dt = row.date.to_pydatetime() - adjustment
-            elif type(row.date) == date:
-                dt = row.date - adjustment
-                dt = datetime.combine(dt, datetime.min.time())
-            elif type(row.date) == str:
-                dt = datetime.strptime(row.date, "%Y-%m-%d")
-
-            if dt is None:
-                continue
-
-            dt = dt.replace(tzinfo=CHINA_TZ)
-
-            if dt < start or dt > end:
-                continue
-
-            turnover = 0
-            open_interest = 0
-
-            bar: BarData = BarData(
-                symbol=symbol,
-                exchange=exchange,
-                interval=interval,
-                datetime=dt,
-                open_price=round_to(row.open, 0.000001),
-                high_price=round_to(row.high, 0.000001),
-                low_price=round_to(row.low, 0.000001),
-                close_price=round_to(row.close, 0.000001),
-                volume=row.volume,
-                turnover=turnover,
-                open_interest=open_interest,
-                gateway_name="AK"
-            )
-
-            bar_dict[dt] = bar
-
-        bar_keys = bar_dict.keys()
-        bar_keys = sorted(bar_keys, reverse=False)
-        for i in bar_keys:
-            data.append(bar_dict[i])
-        return data
+        df = clazz().query_tick_history(req)
+        return self.convert_df_to_tick(df)

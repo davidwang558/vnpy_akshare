@@ -21,14 +21,7 @@
 
 安装环境推荐基于3.0.0版本以上的【[**VeighNa Studio**](https://www.vnpy.com)】。
 
-直接使用pip命令：
-
-```
-pip install vnpy_akshare
-```
-
-
-或者下载源代码后，解压后在cmd中运行：
+下载源代码后，解压后在cmd中运行：
 
 ```
 pip install .
@@ -42,5 +35,3 @@ pip install .
 |名称|含义|必填|举例|
 |---------|----|---|---|
 |datafeed.name|名称|是|akshare|
-|datafeed.username|用户名|否|token|
-|datafeed.password|密码|否|token|
